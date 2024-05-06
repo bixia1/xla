@@ -388,6 +388,9 @@ class IrEmitterUnnested : public IrEmitter {
       mlir::Operation::operand_range operands);
 
   GpuElementalIrEmitter elemental_emitter_;
+
+public:
+  std::optional<int64_t> trip_count_ = std::nullopt;
 };
 
 }  // namespace gpu

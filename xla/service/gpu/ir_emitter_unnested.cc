@@ -2509,6 +2509,7 @@ absl::StatusOr<std::unique_ptr<Thunk>> IrEmitterUnnested::BuildWhileThunk(
 
   // Generate thunk sequence for while 'body'.
   auto ir_emitter_body = IrEmitterUnnested::Create(ir_emitter_context_);
+  ir_emitter_body->trip_count_ = trip_count;
   TF_RETURN_IF_ERROR(ir_emitter_body->EmitHloComputation(body));
 
   // Buffer slice holding while loop predicate.
@@ -2632,6 +2633,7 @@ absl::Status IrEmitterUnnested::EmitSendThunk(const HloSendInstruction* instr) {
     auto thunk = std::make_unique<NcclSendThunk>(
         Thunk::ThunkInfo::WithProfileAnnotation(instr), NcclApi::Default(),
         instr, replica_count, partition_count, nccl_buffer);
+    thunk->trip_count_ = trip_count_;
     CollectivesAsyncEvents& collectives_async_events =
         GetCollectivesAsyncEvents();
     int64_t channel_id = instr->channel_id().value();
@@ -2707,6 +2709,7 @@ absl::Status IrEmitterUnnested::EmitRecvThunk(const HloRecvInstruction* instr) {
     auto thunk = std::make_unique<NcclRecvThunk>(
         Thunk::ThunkInfo::WithProfileAnnotation(instr), NcclApi::Default(),
         instr, replica_count, partition_count, nccl_buffer);
+    thunk->trip_count_ = trip_count_;
     CollectivesAsyncEvents& collectives_async_events =
         GetCollectivesAsyncEvents();
     int64_t channel_id = instr->channel_id().value();

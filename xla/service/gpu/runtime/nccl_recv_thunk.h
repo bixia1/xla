@@ -52,6 +52,8 @@ class NcclRecvThunk : public NcclCollectiveThunk {
   const Buffer buffer_;
   const AsyncStreamKind stream_kind_;
   std::shared_ptr<ExecutionCounters> execution_counters_;
+ public:
+  std::optional<int64_t> trip_count_ = std::nullopt;
 };
 
 absl::Status RunRecv(NcclApi* nccl_api,

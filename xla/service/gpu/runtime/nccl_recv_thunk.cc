@@ -120,7 +120,10 @@ absl::Status NcclRecvThunk::RunNcclCollective(
       if (it == config_.source_target_to_bounds.end()) {
         return absl::InternalError("Missing bounds for conditional Recv");
       }
-      if (*counter < it->second.first || *counter > it->second.second) {
+      CHECK(trip_count_.has_value());
+      int64_t counter_value = *counter % trip_count_.value();
+      VLOG(3) << "trip_count: " << *trip_count_ << " old counter_value " << *counter << " new counter_value " << counter_value;
+      if (counter_value < it->second.first || counter_value > it->second.second) {
         should_run = false;
       }
       VLOG(3) << "RunNcclCollective counter " << *counter << " " << should_run;
