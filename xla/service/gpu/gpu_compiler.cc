@@ -885,22 +885,26 @@ absl::Status RunCollectiveOptimizationPasses(
         /*reuse_pipelined_op_buffer=*/HloPredicateFalse};
     collectives_pipeline.AddPass<CollectivePipeliner>(config);
   }
-
+#if 0 // take off the cycle decomposer as we don't actually want to decompose it.
   collectives_pipeline.AddPass<CollectivePermuteCycleDecomposer>(
       hlo_module->config()
           .debug_options()
           .xla_gpu_collective_permute_decomposer_threshold());
+#endif
 
   collectives_pipeline.AddPass<CollectivePermuteDecomposer>(
       hlo_module->config()
           .debug_options()
-          .xla_gpu_collective_permute_decomposer_threshold());
+          .xla_gpu_collective_permute_decomposer_threshold(),
+      hlo_module->config().debug_options().xla_gpu_enable_pipelined_p2p());
 
   if (hlo_module->config()
           .debug_options()
           .xla_gpu_enable_pipelined_collectives() ||
-      hlo_module->config().debug_options().xla_gpu_enable_pipelined_p2p()) {
-    AddP2PPipeliner(collectives_pipeline);
+      hlo_module->config().debug_options().xla_gpu_enable_pipelined_p2p() > 0) {
+    AddP2PPipeliner(
+        collectives_pipeline,
+        hlo_module->config().debug_options().xla_gpu_enable_pipelined_p2p());
   }
 
   // Run algebraic simplifier to reshape(broadcast) into a broadcast when
@@ -2156,7 +2160,7 @@ absl::Status GpuCompiler::RunPostSchedulingPipelines(
     if (module->config()
             .debug_options()
             .xla_gpu_enable_pipelined_collectives() ||
-        module->config().debug_options().xla_gpu_enable_pipelined_p2p()) {
+        module->config().debug_options().xla_gpu_enable_pipelined_p2p() == 2) {
       pipeline.AddPass<PipelinedP2PRewriter>();
     }
     HloPredicate is_nop =

@@ -64,8 +64,8 @@ class CollectivePipeliner : public HloModulePass {
 
   // Postprocessing cloned collective instructions, such as for modifying loop
   // iteration related frontend attributes to reflect loop pipelining.
-  using HloPostprocessor =
-      std::optional<std::function<absl::Status(HloInstruction* instr)>>;
+  using HloPostprocessor = std::optional<
+      std::function<absl::Status(HloInstruction* instr, uint64_t trip_count)>>;
 
   struct Config {
     int64_t level_to_operate_on = 0;
@@ -97,8 +97,9 @@ class CollectivePipeliner : public HloModulePass {
     // pipelined. The control dependencies will be dropped when the operation is
     // pipelined. This is currently only used to support kBackward pipelining.
     bool should_allow_control_dependencies = false;
-    HloPostprocessor postprocess_backward_peeled_op = std::nullopt;
-    HloPostprocessor postprocess_backward_rotated_op = std::nullopt;
+    HloPostprocessor postprocess_backward_peeled_first = std::nullopt;
+    HloPostprocessor postprocess_backward_loop = std::nullopt;
+    HloPostprocessor postprocess_backward_peeled_last = std::nullopt;
   };
   static const char* const kInsertedByPreviousStep;
   static const char* const kSunkByPreviousStep;

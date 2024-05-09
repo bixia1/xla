@@ -62,12 +62,6 @@ bool IsP2POp(const HloInstruction* op) {
 // operations, regardless whether they are on hosts or on devices.
 bool IsCollectiveOp(const HloInstruction* op) {
   HloOpcode opcode = op->opcode();
-  // TODO(b/309639264): We temporarily make this pass to also order custom-calls
-  // with respect to P2P chains, to workaround an NVIDIA bug. Remove the code
-  // for custom-calls once the bug has been fixed.
-  if (opcode == HloOpcode::kCustomCall) {
-    return true;
-  }
 
   return hlo_query::IsAsyncCollectiveDoneOp(op, /*include_send_recv=*/true) ||
          (hlo_query::IsCollectiveCommunicationOp(opcode) &&
@@ -434,7 +428,8 @@ absl::Status MayAddWhileOpToPipelinedGroup(HloInstruction* while_op,
   int pipelined_group = 0;
   // Check whether the while-op init contains a token from a Send result.
   for (auto hlo : while_op->while_init()->operands()) {
-    if (hlo->opcode() != HloOpcode::kSendDone) {
+    // Checking for RecvDone works for both pipelining methods.
+    if (hlo->opcode() != HloOpcode::kRecvDone) {
       continue;
     }
     int64_t channel_id = hlo->channel_id().value();
@@ -565,7 +560,8 @@ absl::Status ConnectUnpipelined2P2P(const P2PGroup& p2p_group,
 absl::Status GatherP2PGroupsAndCollectiveInfo(
     const HloComputation* computation, P2PInComputation& p2p_in_computation,
     P2PGroupMap& p2p_group_map,
-    CollectiveInComputation& collective_in_computation) {
+    CollectiveInComputation& collective_in_computation,
+    int32_t pipeline_method) {
   collective_in_computation[computation] = false;
   std::vector<HloInstruction*> while_ops;
   for (auto hlo : computation->MakeInstructionPostOrder()) {
@@ -646,6 +642,11 @@ absl::Status GatherP2PGroupsAndCollectiveInfo(
   absl::erase_if(p2p_group_map, [](const auto& p2p_group) {
     return p2p_group.second.kind == kUnrecognized;
   });
+
+  if (pipeline_method != 2) {
+    // No need to connect complement group unless pipeline_method is 2.
+    return OkStatus();
+  }
 
   // Connect two groups that form a cycle, both for pipelined and unpipelined
   // cases for the current computation. We only build such a connection when we
@@ -800,6 +801,8 @@ absl::Status LinearizeCollectivesWithOtherP2P(
       continue;
     }
 
+    // we can now skip this as that cuda bug has been fixed.
+    #if 0
     if (!MayInvokeCollectiveOp(hlo, collective_in_computation)) {
       continue;
     }
@@ -815,11 +818,20 @@ absl::Status LinearizeCollectivesWithOtherP2P(
         TF_RETURN_IF_ERROR(OrderBefore(reachability, start_end.second,
                                        GetStartOpForDoneOp(hlo)));
       } else {
+        if (!reachability->IsReachable(hlo, start_end.first)) {
+          // This is a case where we can either order hlo before send/recv
+          // or send/recv before hlo. We choose the former to support this
+          // scenario for your experiment:
+          //    acyclic-CP-1 decomposed into send/recv (start_end in this code)
+          //   cyclic-CP-2 not decomposed (hlo in this code)
+          TF_RETURN_IF_ERROR(OrderBefore(reachability, start_end.second,
+                                       GetStartOpForDoneOp(hlo)));
+        }
         // Order the async op before chain A.
-        TF_RETURN_IF_ERROR(OrderBefore(reachability, hlo, start_end.first));
+        //TF_RETURN_IF_ERROR(OrderBefore(reachability, hlo, start_end.first));
       }
     }
-    // CustomCall or other op that indirectly invoke collectives.
+    // Other ops that indirectly invoke collectives.
     if (reachability->IsReachable(start_end.first, hlo)) {
       // Order chain A before the op.
       TF_RETURN_IF_ERROR(OrderBefore(reachability, start_end.second, hlo));
@@ -827,6 +839,7 @@ absl::Status LinearizeCollectivesWithOtherP2P(
       // Order the op before chain A.
       TF_RETURN_IF_ERROR(OrderBefore(reachability, hlo, start_end.first));
     }
+    #endif
   }
 
   return OkStatus();
@@ -877,8 +890,137 @@ absl::Status LinearizeCollectivesWithPipelinedP2PChild(
       continue;
     }
 
-    // Async done, CustomCall, or other ops that indirectly invoke collectives.
+    // Async done, other ops that indirectly invoke collectives.
     TF_RETURN_IF_ERROR(OrderBefore(reachability, hlo, start_end.first));
+  }
+
+  return OkStatus();
+}
+
+Status ConnectP2P1NodeChainMethod1(const P2PGroupNode& node) {
+  HloRecvDoneInstruction* recv_done = node.recv_done;
+  HloSendInstruction* send = node.send;
+  TF_RETURN_IF_ERROR(OrderBefore(recv_done, send));
+  return OkStatus();
+}
+
+// Adds control dependence to enforce this ordering:
+//   recv => recv-done => send => send-done.
+Status ConnectPipelined1P2PParentMethod1(const P2PGroup& p2p_group) {
+  VLOG(10) << "ConnectPipelined1P2PParentMethod1";
+  const P2PGroupNode& node = p2p_group.GetParent();
+  HloRecvDoneInstruction* recv_done = node.recv_done;
+  HloSendInstruction* send = node.send;
+  TF_RETURN_IF_ERROR(OrderBefore(recv_done, send));
+  return OkStatus();
+}
+
+// Adds control dependence to enforce this ordering:
+//   send => send-done => recv => recv-done
+Status ConnectPipelined1P2PChildMethod1(const P2PGroup& p2p_group) {
+  const P2PGroupNode& node = p2p_group.GetChild();
+  VLOG(10) << "ConnectPipelined1P2PChildMethod1";
+  HloSendDoneInstruction* send_done = node.send_done;
+  HloRecvInstruction* recv = node.recv;
+  TF_RETURN_IF_ERROR(OrderBefore(send_done, recv));
+  return OkStatus();
+}
+
+// For a given computation, adds control dependence to chain a pipelined or
+// unpipelined P2P group in the computation. Returns the total number of such
+// chains. If the computation is a while-body, verifies that at most one group
+// is pipelined and returns the pipelined group.
+absl::StatusOr<std::pair<int, const P2PGroup*>> ConnectP2PChainMethod1(
+    HloComputation* computation, const P2PGroupMap& p2p_group_map,
+    const std::set<int64_t>& p2p_channels) {
+  VLOG(10) << "ConnectP2PChainMethod1";
+  // If the current computation is a while-body and has a pipelined P2P chain,
+  // record such a P2P group.
+  const P2PGroup* pipelined_group = nullptr;
+  int num_p2p_chains = 0;
+  for (int64_t channel : p2p_channels) {
+    auto it = p2p_group_map.find(channel);
+    if (it == p2p_group_map.end()) {
+      // The instructions that use the channel don't form an interesting P2P
+      // group, do nothing.
+      continue;
+    }
+    num_p2p_chains++;
+    const P2PGroup& p2p_group = it->second;
+    P2PGroupKind kind = p2p_group.kind;
+    if (kind == P2PGroupKind::kUnpipelined) {
+      CHECK(!p2p_group.InCycle());
+      CHECK(p2p_group.runtime_stream == kUnknown);
+      TF_RETURN_IF_ERROR(ConnectUnpipelinedP2P(p2p_group));
+      continue;
+    }
+
+    CHECK(!p2p_group.InCycle());
+    if (computation == p2p_group.ParentComputation()) {
+      TF_RETURN_IF_ERROR(ConnectPipelined1P2PParentMethod1(p2p_group));
+    } else {
+      // A pipeline of one group.
+      if (pipelined_group != nullptr) {
+        return Internal("Expected <=1 pipelined group in a while-body");
+      }
+      pipelined_group = &p2p_group;
+      TF_RETURN_IF_ERROR(ConnectPipelined1P2PChildMethod1(p2p_group));
+    }
+  }
+  return std::make_pair(num_p2p_chains, pipelined_group);
+}
+
+// Adds control dependence to linearize other collective ops with respect to
+// the given pipelined P2P chain in the computation for the pipelined
+// while-loop. All Collective ops should be scheduled between SendDone and
+// Recv.
+Status LinearizeCollectivesWithPipelinedP2PChildMethod1(
+    const P2PGroupMap& p2p_group_map, const P2PGroup& group,
+    const CollectiveInComputation& collective_in_computation,
+    HloComputation* computation, HloReachabilityMap* reachability) {
+  HloInstruction* send_done = group.GetChild().send_done;
+  HloInstruction* recv = group.GetChild().recv;
+  VLOG(10) << "LinearizeCollectivesWithPipelinedP2PChildMethod1";
+  // If an hlo may invoke collective operation, we add control dependence to
+  // make sure that the hlo is scheduled before the pipelined chain starts.
+  for (HloInstruction* hlo : computation->MakeInstructionPostOrder()) {
+    // For async collective ops, only the done version of the op passes this
+    // check, to avoid handling async ops twice.
+    if (!MayInvokeCollectiveOp(hlo, collective_in_computation)) {
+      continue;
+    }
+
+    HloOpcode opcode = hlo->opcode();
+    // Handle a P2P group when we see its Send-done.
+    if (IsP2POp(hlo) && opcode != HloOpcode::kSendDone) {
+      continue;
+    }
+    if (hlo->opcode() == HloOpcode::kSendDone) {
+      auto group_it = p2p_group_map.find(hlo->channel_id().value());
+      if (group_it == p2p_group_map.end()) {
+        continue;
+      }
+      const P2PGroup& cur_group = group_it->second;
+      P2PGroupKind kind = cur_group.kind;
+      if (kind == P2PGroupKind::kPipelined &&
+          computation == cur_group.ChildComputation()) {
+        // This is a P2P group for the pipelined in the current while-body.
+        // We are looking for other collective ops outside this group.
+        continue;
+      }
+
+      ChainStartEnd cur_start_end =
+          cur_group.GetChainStartEnd(computation, p2p_group_map);
+      TF_RETURN_IF_ERROR(
+          OrderBefore(reachability, send_done, cur_start_end.first));
+      TF_RETURN_IF_ERROR(OrderBefore(reachability, cur_start_end.second, recv));
+
+      continue;
+    }
+
+    // Async done, other ops that indirectly invoke collectives.
+    TF_RETURN_IF_ERROR(OrderBefore(reachability, send_done, hlo));
+    TF_RETURN_IF_ERROR(OrderBefore(reachability, recv, hlo));
   }
 
   return OkStatus();
@@ -893,6 +1035,15 @@ absl::StatusOr<bool> P2PSchedulePreparation::Run(
   P2PInComputation p2p_in_computation;
   CollectiveInComputation collective_in_computation;
 
+  // This is a hack, currently assume pipeline method 2 unless a frontend
+  // attribute is found.
+  int32_t pipeline_method = 2;
+  auto it = module->frontend_attributes().map().find(
+      "_xla_send_recv_pipeline_method");
+  if (it != module->frontend_attributes().map().end() && it->second == "1") {
+    pipeline_method = 1;
+  }
+
   std::vector<HloComputation*> all_computations =
       module->MakeComputationPostOrder(execution_threads);
 
@@ -905,7 +1056,8 @@ absl::StatusOr<bool> P2PSchedulePreparation::Run(
     VLOG(10) << "Gathering P2P groups and collective info for computation "
              << (*iter)->name();
     TF_RETURN_IF_ERROR(GatherP2PGroupsAndCollectiveInfo(
-        *iter, p2p_in_computation, p2p_group_map, collective_in_computation));
+        *iter, p2p_in_computation, p2p_group_map, collective_in_computation,
+        pipeline_method));
   }
 
   if (p2p_group_map.empty()) {
@@ -930,8 +1082,15 @@ absl::StatusOr<bool> P2PSchedulePreparation::Run(
     // Connect P2P chains and return the number of chains and the P2P group
     // representation for pipelined P2P in the current computation as a
     // while-body.
-    TF_ASSIGN_OR_RETURN(
-        auto result, ConnectP2PChain(computation, p2p_group_map, p2p_channels));
+    std::pair<int, const P2PGroup*> result;
+    if (pipeline_method == 1) {
+      TF_ASSIGN_OR_RETURN(
+          result,
+          ConnectP2PChainMethod1(computation, p2p_group_map, p2p_channels));
+    } else {
+      TF_ASSIGN_OR_RETURN(
+          result, ConnectP2PChain(computation, p2p_group_map, p2p_channels));
+    }
     if (result.first == 0) {
       continue;
     }
@@ -942,12 +1101,19 @@ absl::StatusOr<bool> P2PSchedulePreparation::Run(
     std::unique_ptr<HloReachabilityMap> reachability =
         HloReachabilityMap::Build(computation);
     if (result.second != nullptr) {
-      // The current computation is a while-body with pipelined P2P chain.
-      // Order all other collectives in a pipelined while-body before the
-      // pipelined P2P chain.
-      TF_RETURN_IF_ERROR(LinearizeCollectivesWithPipelinedP2PChild(
-          p2p_group_map, *result.second, collective_in_computation, computation,
-          reachability.get()));
+      if (pipeline_method == 1) {
+        // All other collectives should be ordered between SendDone and Recv.
+        TF_RETURN_IF_ERROR(LinearizeCollectivesWithPipelinedP2PChildMethod1(
+            p2p_group_map, *result.second, collective_in_computation,
+            computation, reachability.get()));
+      } else {
+        // The current computation is a while-body with pipelined P2P chain.
+        // Order all other collectives in a pipelined while-body before the
+        // pipelined P2P chain.
+        TF_RETURN_IF_ERROR(LinearizeCollectivesWithPipelinedP2PChild(
+            p2p_group_map, *result.second, collective_in_computation,
+            computation, reachability.get()));
+      }
     }
 
     // Add control dependence to linearize collective operations with respect to
@@ -975,7 +1141,9 @@ absl::StatusOr<bool> P2PSchedulePreparation::Run(
         // to other collectives.
         continue;
       }
-
+      // Currently, the two pipeline methods have the same start/end for the
+      // pipeline group if the pipelined node is not in the while-body, which
+      // is the case here.
       ChainStartEnd start_end =
           group.GetChainStartEnd(computation, p2p_group_map);
 

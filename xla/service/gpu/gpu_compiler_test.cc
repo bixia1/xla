@@ -502,7 +502,7 @@ CHECK-SAME:    frontend_attributes={_xla_send_recv_pipeline="0"}
   DebugOptions debug_options = GetDebugOptionsForTest();
   debug_options.set_xla_gpu_enable_latency_hiding_scheduler(true);
   debug_options.set_xla_gpu_collective_permute_decomposer_threshold(1);
-  debug_options.set_xla_gpu_enable_pipelined_p2p(true);
+  debug_options.set_xla_gpu_enable_pipelined_p2p(2);
   debug_options.set_xla_gpu_enable_triton_gemm(false);
   config.set_debug_options(debug_options);
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,

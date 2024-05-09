@@ -327,16 +327,35 @@ absl::StatusOr<bool> CollectivePermuteDecomposer::Run(
     // Decompose the collective-permute, may add frontend attribute to record
     // pipeline decision.
     for (HloCollectivePermuteInstruction* cp : cps_to_decompose) {
-      std::string pipeline_decision;
-      if (cp0_to_pipeline == cp) {
-        pipeline_decision = "0";
-      } else if (cp1_to_pipeline == cp) {
-        pipeline_decision = "1";
+      std::string pipeline_decision("");
+      if (pipeline_method_ == 1) {
+        // We only pipeline the collective_permute with the forward edges when
+        // a pair of collective_permute form a cycle.
+        if (cp0_to_pipeline && cp1_to_pipeline) {
+          if (cp == cp1_to_pipeline) {
+            pipeline_decision = "0";
+          }
+        } else if (cp0_to_pipeline == cp) {
+          pipeline_decision = "0";
+        }
+      } else if (pipeline_method_ == 2) {
+        if (cp0_to_pipeline == cp) {
+          pipeline_decision = "0";
+        } else if (cp1_to_pipeline == cp) {
+          pipeline_decision = "1";
+        }
       }
       TF_RETURN_IF_ERROR(
           DecomposeCollectivePermute(cp, computation, pipeline_decision));
     }
     if (!cps_to_decompose.empty()) {
+      // This is a hack, to tell the pipeliner and p2p-scheduler-preparation
+      // which pipeline method is used, if the decomposed send/recv are
+      // pipelined.
+      FrontendAttributes attributes;
+      (*attributes.mutable_map())["_xla_send_recv_pipeline_method"] =
+          std::to_string(pipeline_method_);
+      module->add_frontend_attributes(attributes);
       changed = true;
     }
   }

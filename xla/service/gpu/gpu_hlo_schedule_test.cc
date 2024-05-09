@@ -28,6 +28,7 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/log/log.h"
 #include "absl/strings/string_view.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -35,8 +36,15 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_schedule.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/backend.h"
+#include "xla/service/collective_permute_decomposer.h"
+#include "xla/service/gpu/collective_permute_cycle_decomposer.h"
+#include "xla/service/gpu/gpu_p2p_pipeliner.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/hlo_ordering.h"
+#include "xla/service/hlo_parser.h"
+#include "xla/service/hlo_pass_pipeline.h"
+#include "xla/service/hlo_verifier.h"
+#include "xla/service/p2p_schedule_preparation.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
@@ -49,6 +57,8 @@ limitations under the License.
 
 namespace xla {
 namespace gpu {
+
+using ::testing::HasSubstr;
 
 class GpuHloScheduleTest : public HloTestBase {
  protected:
@@ -1415,6 +1425,182 @@ TEST_F(GpuHloSchedulePostProcessTest, PostProcessAsyncCollectives) {
   for (int i = 0; i < result.size(); ++i) {
     EXPECT_EQ(expected_sequence[i], result.instructions()[i]->name());
   }
+}
+
+TEST_F(GpuHloScheduleTest, SomehowIntegrationTest) {
+  const char* const kModuleStr = R"(
+ HloModule cp
+
+cond {
+    param = (u32[], f32[1, 1024, 1024]) parameter(0)
+    count = get-tuple-element(%param), index=0
+    ub = u32[] constant(11)
+    ROOT result = pred[] compare(count, ub), direction=LT
+ }
+
+body {
+    param = (u32[], f32[1, 1024, 1024]) parameter(0)
+    count = get-tuple-element(%param), index=0
+    send-data = get-tuple-element(%param), index=1
+
+    recv-data = f32[1, 1024, 1024] collective-permute(send-data),
+      source_target_pairs={{0,1}, {1,2}, {2,3}, {3,0}}, channel_id=1,
+      frontend_attributes={
+      _xla_send_recv_validation="{{0,7},{1,8},{2,9},{3,10}}"
+      }
+    //_xla_send_recv_validation="{{0,7},{1,8},{2,9},{3,10}}"
+    //_xla_send_recv_validation="{{0,11},{0,11},{0,11},{0,11}}"
+
+    // The computation code that uses the current recv-data and
+    // produces the send-data for the next iteration.
+    c1 = u32[] constant(1)
+    new_count = u32[] add(count, c1)
+    replica = u32[] replica-id()
+    c10 = u32[] constant(10)
+    sum = u32[] add(replica, c10)
+    sum2 = u32[] add(sum, count)
+    conv = f32[] convert(sum2)
+    p = f32[1, 1024, 1024] broadcast(conv), dimensions={}
+    b = f32[1, 1024, 1024] add(p, recv-data)
+    c = f32[1, 1024, 1024] multiply(b, b)
+    d = f32[1, 1024, 1024] tan(c)
+    s = f32[1, 1024, 1024] dot(c, d), lhs_batch_dims={0},
+      lhs_contracting_dims={1}, rhs_batch_dims={0}, rhs_contracting_dims={1}
+
+    custom-call = f32[1, 1024, 1024] custom-call(s), custom_call_target="my_custom_call"
+
+    ROOT result = (u32[], f32[1, 1024, 1024]) tuple(new_count, custom-call)
+}
+
+ENTRY test_computation {
+    c0 = u32[] constant(0)
+    f0 = f32[] constant(0.0)
+    init = f32[1, 1024, 1024] broadcast(f0), dimensions={}
+    while_init = (u32[], f32[1, 1024, 1024]) tuple(c0, init)
+    while_result = (u32[], f32[1, 1024, 1024]) while(while_init), body=body, condition=cond
+    ROOT result = f32[1, 1024, 1024] get-tuple-element(while_result), index=1
+}
+  )";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnUnverifiedModule((kModuleStr)));
+  HloPassPipeline pipeline("optimizer");
+  pipeline.AddPass<HloVerifier>(/*layout_sensitive=*/false,
+                                /*allow_mixed_precision=*/false);
+  pipeline.AddPass<CollectivePermuteCycleDecomposer>(0);
+  pipeline.AddPass<CollectivePermuteDecomposer>(0, 1);
+  AddP2PPipeliner(pipeline, 1);
+  EXPECT_TRUE(pipeline.Run(module.get()).value());
+  VLOG(0) << module->ToString();
+
+#if 0
+  P2PSchedulePreparation preparation;
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, preparation.Run(module.get()));
+  VLOG(10) << module->ToString();
+  EXPECT_TRUE(changed);
+#else
+  SequentialHloOrdering order = BuildHloOrdering(module.get());
+  VLOG(0) << order.ToString();
+#endif
+
+  auto while_op = FindInstruction(module.get(), "while");
+  EXPECT_EQ(while_op->opcode(), HloOpcode::kWhile);
+  EXPECT_EQ(while_op->shape().tuple_shapes().size(), 4);
+
+  // The forward edges in main, recv is peeled iter 0 before the while-op
+  // send is peeled iter 10 after the while-op.
+  auto recv2 =
+      DynCast<HloRecvInstruction>(FindInstruction(module.get(), "recv.2"));
+  EXPECT_NE(recv2, nullptr);
+  auto send5 =
+      DynCast<HloSendInstruction>(FindInstruction(module.get(), "send.5"));
+  EXPECT_NE(send5, nullptr);
+  EXPECT_EQ(recv2->channel_id(), send5->channel_id());
+  EXPECT_THAT(
+      recv2->ToString(),
+      HasSubstr("_xla_send_recv_source_target_pairs=\"{{0,1},{1,2},{2,3}}\""));
+  EXPECT_THAT(recv2->ToString(),
+              HasSubstr("_xla_send_recv_validation=\"{{0,0},{1,0},{1,0}}\""));
+  EXPECT_THAT(send5->ToString(),
+              HasSubstr("_xla_send_recv_validation=\"invalid\""));
+  EXPECT_EQ(send5->control_predecessors()[0],
+            FindInstruction(module.get(), "recv-done.2"));
+
+  // The back edge in main, peeled iter 10 after the while-op.
+  auto recv5 =
+      DynCast<HloRecvInstruction>(FindInstruction(module.get(), "recv.5"));
+  EXPECT_NE(recv5, nullptr);
+  auto send4 =
+      DynCast<HloSendInstruction>(FindInstruction(module.get(), "send.4"));
+  EXPECT_NE(send4, nullptr);
+  EXPECT_EQ(recv5->channel_id(), send4->channel_id());
+  EXPECT_THAT(recv5->ToString(),
+              HasSubstr("_xla_send_recv_source_target_pairs=\"{{3,0}}\""));
+  EXPECT_THAT(recv5->ToString(),
+              HasSubstr("_xla_send_recv_validation=\"{{0,0}}\""));
+  EXPECT_THAT(send4->ToString(),
+              HasSubstr("_xla_send_recv_validation=\"{{0,0}}\""));
+  EXPECT_EQ(recv5->control_predecessors()[0],
+            FindInstruction(module.get(), "send-done.5"));
+  EXPECT_EQ(send4->control_predecessors()[0], recv5);
+  EXPECT_EQ(
+      FindInstruction(module.get(), "recv-done.5")->control_predecessors()[0],
+      send4);
+  EXPECT_EQ(
+      FindInstruction(module.get(), "send-done.4")->control_predecessors()[0],
+      FindInstruction(module.get(), "recv-done.5"));
+
+  EXPECT_EQ(
+      FindInstruction(module.get(), "custom-call.2")->control_predecessors()[0],
+      FindInstruction(module.get(), "send-done.4"));
+
+  // The forward edges in while-body.
+  auto recv4 =
+      DynCast<HloRecvInstruction>(FindInstruction(module.get(), "recv.4"));
+  EXPECT_NE(recv4, nullptr);
+  auto send3 =
+      DynCast<HloSendInstruction>(FindInstruction(module.get(), "send.3"));
+  EXPECT_NE(send3, nullptr);
+  EXPECT_EQ(recv4->channel_id(), send3->channel_id());
+  EXPECT_THAT(
+      recv4->ToString(),
+      HasSubstr("_xla_send_recv_source_target_pairs=\"{{0,1},{1,2},{2,3}}\""));
+  EXPECT_THAT(recv4->ToString(),
+              HasSubstr("_xla_send_recv_validation=\"{{0,6},{0,7},{1,8}}\""));
+  EXPECT_THAT(send3->ToString(),
+              HasSubstr("_xla_send_recv_validation=\"{{0,6},{0,7},{1,8}}\""));
+
+  // The back edge in while-body.
+  auto recv3 =
+      DynCast<HloRecvInstruction>(FindInstruction(module.get(), "recv.3"));
+  EXPECT_NE(recv3, nullptr);
+  auto send2 =
+      DynCast<HloSendInstruction>(FindInstruction(module.get(), "send.2"));
+  EXPECT_NE(send4, nullptr);
+  EXPECT_EQ(recv3->channel_id(), send2->channel_id());
+  EXPECT_THAT(recv3->ToString(),
+              HasSubstr("_xla_send_recv_source_target_pairs=\"{{3,0}}\""));
+  EXPECT_THAT(recv3->ToString(),
+              HasSubstr("_xla_send_recv_validation=\"{{2,9}}\""));
+  EXPECT_THAT(send2->ToString(),
+              HasSubstr("_xla_send_recv_validation=\"{{2,9}}\""));
+  EXPECT_EQ(send2->control_predecessors()[0], recv3);
+  EXPECT_EQ(
+      FindInstruction(module.get(), "recv-done.3")->control_predecessors()[0],
+      send2);
+  EXPECT_EQ(
+      FindInstruction(module.get(), "send-done.2")->control_predecessors()[0],
+      FindInstruction(module.get(), "recv-done.3"));
+
+  EXPECT_EQ(
+      FindInstruction(module.get(), "custom-call.1")->control_predecessors()[0],
+      recv4);
+  EXPECT_EQ(recv4->control_predecessors()[1],
+            FindInstruction(module.get(), "send-done.2"));
+  EXPECT_EQ(recv4->control_predecessors()[0],
+            FindInstruction(module.get(), "send-done.3"));
+  EXPECT_EQ(recv3->control_predecessors()[0],
+            FindInstruction(module.get(), "send-done.3"));
 }
 
 }  // namespace gpu

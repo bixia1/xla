@@ -38,9 +38,6 @@ namespace gpu {
 namespace {
 
 bool ShouldPipeline(const HloInstruction* instr) {
-  if (!HloPredicateIsOp<HloOpcode::kRecvDone, HloOpcode::kSendDone>(instr)) {
-    return false;
-  }
   // Not annotated for pipelining.
   auto it = instr->frontend_attributes().map().find(kSendRecvPipelineAttr);
   if (it == instr->frontend_attributes().map().end()) {
@@ -68,6 +65,20 @@ bool ShouldPipeline(const HloInstruction* instr) {
   return !is_pipelined;
 }
 
+bool ShouldPipelineMethod1(const HloInstruction* instr) {
+  if (!HloPredicateIsOp<HloOpcode::kRecvDone>(instr)) {
+    return false;
+  }
+  return ShouldPipeline(instr);
+}
+
+bool ShouldPipelineMethod2(const HloInstruction* instr) {
+  if (!HloPredicateIsOp<HloOpcode::kRecvDone, HloOpcode::kSendDone>(instr)) {
+    return false;
+  }
+  return ShouldPipeline(instr);
+}
+
 bool ShouldAllowLoopVariantParameterInChain(const HloInstruction* instr) {
   // Allow any loop parameter needed for pipelining the Send/Recv instructions
   // that have been decided to pipeline.
@@ -79,9 +90,10 @@ bool ShouldAllowLoopVariantParameterInChain(const HloInstruction* instr) {
 absl::Status PostprocessP2PImpl(
     HloInstruction* instr,
     std::function<std::string(std::vector<ReplicaGroup>&)> transformer) {
-  // The input instruction is a Done instruction.
+  // Taking a shortcut here by doing the mutation when we see the done
+  // instruction so that it will work for all three case/callers.
   if (!HloPredicateIsOp<HloOpcode::kRecvDone, HloOpcode::kSendDone>(instr)) {
-    return Internal("Expected SendDone/RecvDone as the pipelined collective");
+    return OkStatus();
   }
   instr = instr->mutable_operand(0);
   if (!HloPredicateIsOp<HloOpcode::kRecv, HloOpcode::kSend>(instr)) {
@@ -93,6 +105,7 @@ absl::Status PostprocessP2PImpl(
       validation_it->second == "invalid") {
     return OkStatus();
   }
+  VLOG(10) << "PostprocessP2PImpl before: " << instr->ToString();
   auto statusor_bounds = ParseReplicaGroupsOnly(validation_it->second);
   if (!statusor_bounds.ok()) {
     return statusor_bounds.status();
@@ -101,12 +114,13 @@ absl::Status PostprocessP2PImpl(
   xla::FrontendAttributes attributes = instr->frontend_attributes();
   (*attributes.mutable_map())[kSendRecvValidationAttr] = validation_attr;
   instr->set_frontend_attributes(attributes);
+  VLOG(10) << "PostprocessP2PImpl after: " << instr->ToString();
   return OkStatus();
 }
 
 // Modifies the loop iteration frontend attribute for the peeled off Send and
 // Recv for the first iteration of a loop.
-absl::Status PostprocessPeeledP2P(HloInstruction* instr) {
+absl::Status PostprocessPeeledFirst(HloInstruction* instr, uint64_t unused) {
   auto transform_bounds = [&](std::vector<ReplicaGroup>& replica_groups) {
     std::vector<std::pair<int64_t, int64_t>> bounds;
     bounds.reserve(replica_groups.size());
@@ -149,7 +163,7 @@ absl::Status PostprocessPeeledP2P(HloInstruction* instr) {
 
 // Modifies the loop iteration frontend attribute for the rotated Send and Recv
 // for the remaining iterations in a loop.
-absl::Status PostprocessRotatedP2P(HloInstruction* instr) {
+absl::Status PostprocessLoop(HloInstruction* instr, uint64_t unused) {
   auto transform_bounds = [&](std::vector<ReplicaGroup>& replica_groups) {
     std::vector<std::pair<int64_t, int64_t>> bounds;
     bounds.reserve(replica_groups.size());
@@ -200,9 +214,55 @@ absl::Status PostprocessRotatedP2P(HloInstruction* instr) {
   return PostprocessP2PImpl(instr, transform_bounds);
 }
 
+// Modifies the loop iteration frontend attribute for the peeled off Send and
+// Recv for the last iteration of a loop.
+Status PostprocessPeeledLast(HloInstruction* instr, uint64_t trip_count) {
+  auto transform_bounds = [&](std::vector<ReplicaGroup>& replica_groups) {
+    VLOG(10) << "PostprocessPeeledLast: " << trip_count;
+    std::vector<std::pair<int64_t, int64_t>> bounds;
+    bounds.reserve(replica_groups.size());
+    int64_t last_idx = trip_count - 1;
+    bool all_invalid = true;
+    for (const auto& replica_group : replica_groups) {
+      // The peeled off instruction is for executing the last iteration of
+      // the loop.
+      int64_t lower_bound = replica_group.replica_ids(0);
+      int64_t upper_bound = replica_group.replica_ids(1);
+      if (lower_bound <= last_idx && upper_bound >= last_idx) {
+        all_invalid = false;
+        bounds.push_back({0, 0});
+      } else {
+        bounds.push_back({1, 0});
+      }
+    }
+    std::string validation_attr;
+    if (all_invalid) {
+      // An optimized way to represent that all source-target pairs are
+      // communicating invalid data, to avoid the overhead related to the use
+      // of execution counters.
+      validation_attr = "invalid";
+    } else {
+      validation_attr = "{" +
+                        absl::StrJoin(bounds, ",",
+                                      absl::PairFormatter(
+                                          [](std::string* out, int64_t value) {
+                                            absl::StrAppend(out, "{", value);
+                                          },
+                                          ",",
+                                          [](std::string* out, int64_t value) {
+                                            absl::StrAppend(out, value, "}");
+                                          })) +
+                        "}";
+    }
+    return validation_attr;
+  };
+  return PostprocessP2PImpl(instr, transform_bounds);
+};
+
 }  // anonymous namespace
 
-void AddP2PPipeliner(HloPassPipeline& pipeline) {
+void AddP2PPipeliner(HloPassPipeline& pipeline, int32_t pipeline_method) {
+  // Get the pipeline method from the module frontend attribute?
   CollectivePipeliner::Config config{
       /*level_to_operate_on=*/0,
       // Pipeline everything annotated for pipelining.
@@ -212,14 +272,17 @@ void AddP2PPipeliner(HloPassPipeline& pipeline) {
       /*process_different_sized_ops=*/true,
       /*pipelining_direction=*/
       CollectivePipeliner::PipeliningDirection::kBackward,
-      /*should_process=*/ShouldPipeline,
+      /*should_process=*/pipeline_method == 1 ? ShouldPipelineMethod1
+                                              : ShouldPipelineMethod2,
       /*acceptable_formatting=*/HloPredicateTrue,
       /*reuse_pipelined_op_buffer=*/HloPredicateTrue,
       /*should_allow_loop_variant_parameter_in_chain=*/
       ShouldAllowLoopVariantParameterInChain,
       /*should_allow_control_dependencies=*/true,
-      /*=postprocess_backward_peeled_op*/ PostprocessPeeledP2P,
-      /*=postprocess_backward_rotated_op*/ PostprocessRotatedP2P};
+      /*=postprocess_backward_peeled_first*/ PostprocessPeeledFirst,
+      /*=postprocess_backward_loop*/ PostprocessLoop,
+      /*=postprocess_backward_peeled_last*/ PostprocessPeeledLast,
+  };
   pipeline.AddPass<CollectivePipeliner>(config);
 }
 

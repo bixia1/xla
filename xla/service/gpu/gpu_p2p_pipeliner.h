@@ -21,7 +21,7 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 // Adds a collective-pipeliner pass for pipelining P2P Send-Recv chains.
-void AddP2PPipeliner(HloPassPipeline& pipeline);
+void AddP2PPipeliner(HloPassPipeline& pipeline, int32_t pipeline_method = 2);
 
 }  // namespace gpu
 }  // namespace xla

@@ -66,9 +66,11 @@ absl::StatusOr<bool> RunOptimizer(
     HloPredicate reuse_pipelined_op_buffer = HloPredicateTrue,
     HloPredicate should_allow_loop_variant_parameter_in_chain =
         HloPredicateFalse,
-    CollectivePipeliner::HloPostprocessor postprocess_backward_peeled =
+    CollectivePipeliner::HloPostprocessor postprocess_backward_peeled_first =
         std::nullopt,
-    CollectivePipeliner::HloPostprocessor postprocess_backward_rotated =
+    CollectivePipeliner::HloPostprocessor postprocess_backward_loop =
+        std::nullopt,
+    CollectivePipeliner::HloPostprocessor postprocess_backward_peeled_last =
         std::nullopt) {
   CollectivePipeliner::Config config = {
       /*level_to_operate_on=*/level_to_operate_on,
@@ -82,8 +84,9 @@ absl::StatusOr<bool> RunOptimizer(
       /*acceptable_formatting=*/acceptable_formatting,
       /*reuse_pipelined_op_buffer=*/reuse_pipelined_op_buffer,
       should_allow_loop_variant_parameter_in_chain,
-      /*should_allow_control_dependencies=*/false, postprocess_backward_peeled,
-      postprocess_backward_rotated};
+      /*should_allow_control_dependencies=*/false,
+      postprocess_backward_peeled_first, postprocess_backward_loop,
+      postprocess_backward_peeled_last};
   HloPassPipeline pass("optimizer");
   pass.AddPass<HloVerifier>(/*layout_sensitive=*/false,
                             /*allow_mixed_precision=*/false);
@@ -1903,13 +1906,13 @@ TEST_F(CollectivePipelinerTest,
   };
   const char* kAttr = "_xla_other_attr";
   // Mutate an existing attribute.
-  auto postprocess_peeled = [&](HloInstruction* instr) {
+  auto postprocess_peeled = [&](HloInstruction* instr, uint64_t unused) {
     xla::FrontendAttributes attributes = instr->frontend_attributes();
     (*attributes.mutable_map())[kAttr] = "1";
     instr->set_frontend_attributes(attributes);
     return OkStatus();
   };
-  auto postprocess_rotated = [&](HloInstruction* instr) {
+  auto postprocess_rotated = [&](HloInstruction* instr, uint64_t unused) {
     xla::FrontendAttributes attributes = instr->frontend_attributes();
     (*attributes.mutable_map())[kAttr] = "2";
     instr->set_frontend_attributes(attributes);

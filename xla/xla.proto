@@ -568,7 +568,10 @@ message DebugOptions {
   bool xla_gpu_enable_pipelined_all_reduce = 217;
   bool xla_gpu_enable_pipelined_all_gather = 227;
   bool xla_gpu_enable_pipelined_reduce_scatter = 231;
-  bool xla_gpu_enable_pipelined_p2p = 246;
+  // 0: do not pipeline
+  // 1: pipeline using a method to peel off Recv&RecvDone
+  // 2: pipeline using a method to peel off Recv&Send
+  int32 xla_gpu_enable_pipelined_p2p = 246;
 
   // The minimum data size in bytes to trigger collective-permute-decomposer
   // transformation.

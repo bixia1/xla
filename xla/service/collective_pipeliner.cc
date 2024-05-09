@@ -2084,8 +2084,9 @@ static absl::Status TransformLoopBackward(
     const WhileLoopAnalysis& loop_analysis, bool insert_non_alias_custom_call,
     int64_t level_to_operate_on, bool process_different_sized_ops,
     HloPredicate should_process, HloPredicate acceptable_formatting,
-    CollectivePipeliner::HloPostprocessor postprocess_peeled,
-    CollectivePipeliner::HloPostprocessor postprocess_rotated,
+    CollectivePipeliner::HloPostprocessor postprocess_peeled_first,
+    CollectivePipeliner::HloPostprocessor postprocess_loop,
+    CollectivePipeliner::HloPostprocessor postprocess_peeled_last,
     int64_t& next_channel_id) {
   // Defining some maps/sets to keep track of instructions duplicated.
   absl::flat_hash_map<HloInstruction*, HloInstruction*> while_body_to_peeled;
@@ -2093,6 +2094,10 @@ static absl::Status TransformLoopBackward(
   absl::flat_hash_set<HloInstruction*> is_pipelined_instruction;
   absl::flat_hash_map<HloInstruction*, int64_t> is_output_instruction;
   absl::flat_hash_set<const HloInstruction*> sideeffect_unused_instructions;
+  uint64_t trip_count =
+      !loop_analysis.GetLoopIterationCount()
+          ? 0
+          : loop_analysis.GetLoopIterationCount()->GetUnsignedValue();
   int64_t count = 0;
   // Add instructions to duplicate into a set.
   for (auto& to_move : loop_analysis.GetMoveInfos()) {
@@ -2183,8 +2188,9 @@ static absl::Status TransformLoopBackward(
                            *loop_analysis.GetLoopIterationIdx(),
                            next_channel_id));
 
-    if (postprocess_peeled.has_value()) {
-      TF_RETURN_IF_ERROR(postprocess_peeled.value()(new_init_operands[idx]));
+    if (postprocess_peeled_first.has_value()) {
+      TF_RETURN_IF_ERROR(
+          postprocess_peeled_first.value()(new_init_operands[idx], trip_count));
     }
   }
   ConstantValue next_loop_iteration =
@@ -2234,9 +2240,6 @@ static absl::Status TransformLoopBackward(
                              *loop_analysis.GetLoopIterationIdx(),
                              next_channel_id, &loop_variant_parameter_info));
 
-      if (postprocess_rotated.has_value()) {
-        TF_RETURN_IF_ERROR(postprocess_rotated.value()(cloned_instr));
-      }
     } else {
       auto new_operands =
           MapNewOperands(instr->operands(), while_body_replacement_map);
@@ -2245,6 +2248,9 @@ static absl::Status TransformLoopBackward(
       TF_RETURN_IF_ERROR(UpdateControlDependencies(instr, cloned_instr,
                                                    while_body_replacement_map));
       UpdateInstructionChannelId(cloned_instr, next_channel_id);
+    }
+    if (postprocess_loop.has_value()) {
+      TF_RETURN_IF_ERROR(postprocess_loop.value()(cloned_instr, trip_count));
     }
     if (it != collective_to_move_map.end()) {
       const int64_t tuple_idx =
@@ -2340,6 +2346,11 @@ static absl::Status TransformLoopBackward(
   while_body_replacement_map[loop_parameter] = new_while_loop;
   std::vector<HloInstruction*> output_tuple_instructions(
       while_loop->shape().tuple_shapes_size(), nullptr);
+  // p2p-schedule-preparation assume no two groups of Send/Recv shared the same
+  // channel_id in the module, unless we pipeline the Send/Recv.
+  // peeling off the last iteration main can violate this unless we reassign
+  // a new channel_id to such cloned Send/Recv. Here is a hack to fix this.
+  absl::flat_hash_map<int64_t, int64_t> old_channel_ids_to_new;
   for (auto* instr : while_body->MakeInstructionPostOrder()) {
     if (instr == loop_parameter || instr == while_body->root_instruction() ||
         sideeffect_unused_instructions.contains(instr)) {
@@ -2366,6 +2377,35 @@ static absl::Status TransformLoopBackward(
     TF_RETURN_IF_ERROR(UpdateControlDependencies(instr, cloned_instr,
                                                  while_body_replacement_map));
     UpdateInstructionChannelId(cloned_instr, next_channel_id);
+
+    if (HloPredicateIsOp<HloOpcode::kSend, HloOpcode::kRecv>(cloned_instr)) {
+      auto pipeline_it =
+          instr->frontend_attributes().map().find("_xla_send_recv_pipeline");
+      if (pipeline_it == instr->frontend_attributes().map().end()) {
+        // not pipelined, need to update channel_id
+        HloSendRecvInstruction* send_recv_instr =
+            DynCast<HloSendRecvInstruction>(cloned_instr);
+        if (!send_recv_instr->is_host_transfer()) {
+          int64_t old_id = send_recv_instr->channel_id().value();
+          auto id_it = old_channel_ids_to_new.find(old_id);
+          int64_t new_id;
+          if (id_it != old_channel_ids_to_new.end()) {
+            new_id = id_it->second;
+          } else {
+            new_id = next_channel_id++;
+            old_channel_ids_to_new[old_id] = new_id;
+          }
+          VLOG(10) << "updating channel_id for " << send_recv_instr->ToString()
+                   << " to " << new_id;
+          send_recv_instr->set_channel_id(new_id);
+        }
+      }
+    }
+
+    if (postprocess_peeled_last.has_value()) {
+      TF_RETURN_IF_ERROR(
+          postprocess_peeled_last.value()(cloned_instr, trip_count));
+    }
     while_body_replacement_map[instr] = cloned_instr;
     if (instruction_is_output_it != is_output_instruction.end()) {
       output_tuple_instructions[instruction_is_output_it->second] =
@@ -2453,8 +2493,10 @@ absl::StatusOr<bool> CollectivePipeliner::Run(
       TF_RETURN_IF_ERROR(TransformLoopBackward(
           loop_analysis, !config_.last_run, config_.level_to_operate_on,
           config_.process_different_sized_ops, config_.should_process,
-          config_.acceptable_formatting, config_.postprocess_backward_peeled_op,
-          config_.postprocess_backward_rotated_op, next_channel_id));
+          config_.acceptable_formatting,
+          config_.postprocess_backward_peeled_first,
+          config_.postprocess_backward_loop,
+          config_.postprocess_backward_peeled_last, next_channel_id));
     }
     ++transformed_loops;
     changed = true;
